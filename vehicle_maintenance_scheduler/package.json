@@ -1,0 +1,22 @@
+{
+  "name": "vehicle-maintenance-scheduler",
+  "version": "1.0.0",
+  "description": "Vehicle maintenance scheduling microservice with knapsack optimization",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node src/server.ts"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "dotenv": "^16.4.0",
+    "logging-middleware": "file:../logging_middleware"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.0",
+    "@types/express": "^4.17.21",
+    "ts-node": "^10.9.2"
+  }
+}
