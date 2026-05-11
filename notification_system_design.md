@@ -475,3 +475,253 @@ WHERE n.notification_type = 'Placement'
 With the type-based index suggested earlier (`idx_notifications_type_created`), this query can efficiently scan only Placement notifications from the last 7 days.
 
 ---
+
+# Stage 4
+
+## Scaling Notification Fetching
+
+The core problem: every page load triggers a database query per student. With 50,000 students, the DB gets overwhelmed during peak hours.
+
+### Solution 1: Redis Caching Layer
+
+Cache each student's recent unread notifications in Redis.
+
+**How it works:**
+- On first fetch, query the DB and store the result in Redis with a key like `notifications:unread:{studentId}`
+- Set a TTL of 60-120 seconds
+- Subsequent page loads within the TTL hit Redis instead of PostgreSQL
+- When a new notification is created, invalidate the affected student's cache key
+
+**Tradeoffs:**
+- Pros: Dramatically reduces DB load. Redis handles hundreds of thousands of reads per second. Sub-millisecond response times.
+- Cons: Introduces cache staleness - a student might not see a new notification for up to TTL seconds. Adds infrastructure complexity (Redis cluster, memory management). Cache invalidation on broadcast is expensive (50k keys to invalidate).
+
+### Solution 2: Cursor-Based Pagination
+
+Replace offset-based pagination with cursor-based pagination using the last seen `created_at` timestamp.
+
+```sql
+SELECT id, notification_type, message, created_at
+FROM notifications
+WHERE student_id = $1 AND is_read = FALSE AND created_at < $2
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**Tradeoffs:**
+- Pros: Consistent performance regardless of page depth. No "skipping rows" problem that offset pagination has.
+- Cons: Cannot jump to arbitrary pages. Slightly more complex client implementation.
+
+### Solution 3: WebSocket for Real-Time Updates
+
+Instead of polling on every page load, maintain a WebSocket connection. The server pushes new notifications as they arrive.
+
+**Tradeoffs:**
+- Pros: Eliminates polling entirely for active users. Instant delivery. No wasted DB queries.
+- Cons: Memory overhead for maintaining thousands of persistent connections. Requires sticky sessions or a pub/sub layer (Redis Pub/Sub) for multi-server deployments. Disconnection handling adds complexity.
+
+### Solution 4: HTTP Conditional Requests
+
+Use `ETag` or `Last-Modified` headers. The client sends `If-None-Match` on subsequent requests. If nothing changed, the server returns `304 Not Modified` without querying the DB.
+
+**Tradeoffs:**
+- Pros: Simple to implement. No additional infrastructure.
+- Cons: Still requires the server to check if data changed (though this can be a cheap COUNT query or a cached version hash). Not truly real-time.
+
+### Recommended Strategy
+
+Combine solutions 1 and 3:
+
+- Active/online students use WebSocket connections for real-time push
+- Redis caching handles the initial page load and serves as fallback
+- Cursor-based pagination for historical browsing
+- Unread count is cached separately with short TTL and invalidated on writes
+
+This hybrid approach handles both real-time delivery and burst traffic without overwhelming the database.
+
+---
+
+# Stage 5
+
+## Analyzing the Broadcast Implementation
+
+The current pseudocode:
+```python
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        send_email(student_id, message)
+        save_to_db(student_id, message)
+        push_to_app(student_id, message)
+```
+
+### Shortcomings
+
+1. **Synchronous and sequential** - Processing 50,000 students one by one means the HR waits for all 50,000 emails, DB inserts, and app pushes to complete before getting a response. If each iteration takes 100ms, that is 5,000 seconds (~83 minutes).
+
+2. **No error isolation** - If `send_email` fails for student 201, the entire loop may crash. Students 202-50,000 never get notified. DB saves and app pushes for student 201 are also skipped.
+
+3. **Tightly coupled operations** - Email sending, DB persistence, and app push are fundamentally different operations with different failure modes and latency profiles. Coupling them in a single loop means the slowest operation (email) blocks everything.
+
+4. **No retry mechanism** - Transient failures (SMTP timeout, temporary DB connection issue) cause permanent notification loss.
+
+5. **No idempotency** - If the process crashes after 10,000 students, restarting it from the beginning sends duplicate notifications to the first 10,000.
+
+6. **Single point of failure** - One server handles everything. If it goes down mid-process, partial state is lost.
+
+### Handling the 200 failed emails
+
+Immediate steps:
+1. The 200 failed student IDs should already be captured in a dead letter queue or failure log
+2. Identify the failure reason (SMTP rate limit, invalid email, timeout)
+3. Retry the failed batch with exponential backoff
+4. If retries fail, flag those students for manual review
+5. Ensure the DB save and in-app push for those 200 students are verified independently (they should not have been blocked by email failure)
+
+### Redesigned Architecture
+
+```
+HR clicks "Notify All"
+        |
+        v
+  API Server
+  (accepts request, returns jobId immediately)
+        |
+        v
+  Message Queue (RabbitMQ / Redis Streams)
+  - Creates one message per student
+  - Or batches of 100 students per message
+        |
+        +---> DB Worker Pool (2-3 workers)
+        |     - Bulk INSERT notifications
+        |     - Batches of 500-1000 rows
+        |     - Acknowledges messages on success
+        |
+        +---> Email Worker Pool (5-10 workers)
+        |     - Sends emails with rate limiting
+        |     - Retries up to 3 times with backoff
+        |     - Failed messages go to Dead Letter Queue
+        |
+        +---> Push Worker Pool (2-3 workers)
+              - Sends WebSocket/push notifications
+              - Best-effort delivery (no retry needed)
+```
+
+### Revised Pseudocode
+
+```python
+function notify_all(student_ids: array, message: string) -> job_id:
+    job_id = create_job_record(status="queued", total=len(student_ids))
+
+    for batch in chunk(student_ids, 100):
+        enqueue("notification.batch", {
+            job_id: job_id,
+            student_ids: batch,
+            message: message
+        })
+
+    return job_id
+
+
+function db_worker(batch_message):
+    try:
+        bulk_insert_notifications(batch_message.student_ids, batch_message.message)
+        acknowledge(batch_message)
+    except:
+        retry_with_backoff(batch_message, max_retries=3)
+
+
+function email_worker(batch_message):
+    for student_id in batch_message.student_ids:
+        try:
+            send_email(student_id, batch_message.message)
+        except:
+            enqueue("email.retry", {
+                student_id: student_id,
+                message: batch_message.message,
+                attempt: 1
+            })
+
+
+function email_retry_worker(retry_message):
+    if retry_message.attempt > 3:
+        move_to_dead_letter_queue(retry_message)
+        return
+    try:
+        send_email(retry_message.student_id, retry_message.message)
+    except:
+        retry_message.attempt += 1
+        enqueue_with_delay("email.retry", retry_message, delay=2^retry_message.attempt)
+
+
+function push_worker(batch_message):
+    for student_id in batch_message.student_ids:
+        push_to_connected_client(student_id, batch_message.message)
+```
+
+### Should DB save and email happen together?
+
+No, they should not. Reasons:
+
+1. **Different failure modes** - Database operations fail due to connection issues or constraint violations. Emails fail due to SMTP limits, invalid addresses, or provider outages. Coupling them means an email failure prevents a perfectly valid DB write.
+
+2. **Different latency** - DB inserts are fast (1-5ms). Email sending is slow (50-500ms per email). Blocking DB writes on email delivery wastes time.
+
+3. **Different consistency requirements** - The notification must be persisted in the DB reliably (this is the source of truth). Email is a delivery channel that can be retried. Losing a DB record is unacceptable; a delayed email retry is acceptable.
+
+4. **Atomicity is not needed** - A student can receive the in-app notification even if the email fails. The in-app notification (from DB) is the primary channel. Email is supplementary.
+
+The correct approach is to save to DB first (guaranteed persistence), then fire email and push as separate async operations that can fail and retry independently.
+
+---
+
+# Stage 6
+
+## Priority Inbox Implementation
+
+### Approach
+
+The priority inbox needs to efficiently maintain the top `n` most important unread notifications based on two factors:
+
+1. **Type weight**: Placement (3) > Result (2) > Event (1)
+2. **Recency**: More recent notifications score higher
+
+### Scoring Formula
+
+```
+score = (typeWeight * 1000) + recencyScore
+```
+
+Where `recencyScore = max(0, 1000 - ageInHours)`. The type weight is multiplied by 1000 to ensure it always dominates over recency within the same weight class, while still allowing a very recent Event to potentially rank near an older Result.
+
+### Data Structure: Min-Heap
+
+A min-heap of size `n` is used to efficiently track the top-n notifications:
+
+1. Iterate through all notifications
+2. For each notification, calculate its priority score
+3. If the heap has fewer than `n` elements, insert directly
+4. If the score is greater than the heap's minimum (root), replace the root and sift down
+5. After processing all notifications, extract from the heap in sorted order
+
+**Time complexity:** O(m log n) where m is total notifications and n is the desired top count. This is better than sorting all notifications (O(m log m)) when n is much smaller than m.
+
+### How New Notifications Maintain Top-N Efficiently
+
+When a new notification arrives in real-time:
+
+1. Calculate its priority score
+2. Compare with the current minimum in the heap (the root of the min-heap)
+3. If the new score is higher than the minimum, replace the root and sift down - O(log n)
+4. If the new score is lower, discard it - O(1)
+
+This means each incoming notification requires at most O(log n) work to maintain the priority inbox, making it suitable for real-time streaming scenarios without reprocessing the entire dataset.
+
+### Running the Implementation
+
+```bash
+cd notification_app_be
+npm install
+npx ts-node src/index.ts
+```
+
+The output displays a formatted table showing the top 10 notifications ranked by priority score, along with their type, message, timestamp, and computed score.
